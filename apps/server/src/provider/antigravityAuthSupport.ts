@@ -245,14 +245,39 @@ const linkAntigravityUserSkills = Effect.fn("linkAntigravityUserSkills")(functio
     [links[1], targets[1]],
   ] as const) {
     yield* Effect.gen(function* () {
+      // `null` is a real directory, which the agent creates itself when there is no link.
       const existing = yield* fs.readLink(link).pipe(
-        Effect.map((value): string | undefined => path.resolve(path.dirname(link), value)),
+        Effect.map((value): string | null | undefined => path.resolve(path.dirname(link), value)),
         Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined),
+        Effect.catch((error) =>
+          fs
+            .stat(link)
+            .pipe(
+              Effect.flatMap((info) =>
+                info.type === "Directory" ? Effect.succeed(null) : Effect.fail(error),
+              ),
+            ),
+        ),
       );
-      if (existing === target) return;
-      if (existing !== undefined) {
-        yield* fs.remove(link);
+      // A link to a missing directory makes the agent's `mkdir` of the skills folder fail with
+      // "Cannot create a file when that file already exists", which surfaces as `session/new` -32603.
+      // `stat` follows links, so a target that is itself a dangling link counts as missing, as does any
+      // target that cannot be read as a directory.
+      const targetIsDirectory = yield* fs.stat(target).pipe(
+        Effect.map((info) => info.type === "Directory"),
+        Effect.orElseSucceed(() => false),
+      );
+      if (existing === null) {
+        if (!targetIsDirectory) return;
+        // `rmdir` only removes an empty directory, so skills a running agent just wrote are never lost.
+        yield* Effect.tryPromise(() => NodeFSP.rmdir(link));
+      } else if (existing === target && targetIsDirectory) {
+        return;
+      } else if (existing !== undefined) {
+        // `force`: the link may already be gone.
+        yield* fs.remove(link, { force: true });
       }
+      if (!targetIsDirectory) return;
       yield* fs.makeDirectory(path.dirname(link), { recursive: true });
       yield* Effect.tryPromise(() =>
         NodeFSP.symlink(target, link, input.platform === "win32" ? "junction" : "dir"),

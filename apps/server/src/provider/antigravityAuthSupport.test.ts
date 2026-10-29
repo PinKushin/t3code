@@ -1,3 +1,5 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off - a junction links without elevation on Windows, and Effect's symlink cannot make one.
+import * as NodeFSP from "node:fs/promises";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodePath from "@effect/platform-node/NodePath";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -588,6 +590,7 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
         const configSkills = path.join(userHome, ".gemini", "config", "skills");
         const cliSkills = path.join(userHome, ".gemini", "antigravity-cli", "skills");
         yield* fs.makeDirectory(path.join(configSkills, "review"), { recursive: true });
+        yield* fs.makeDirectory(cliSkills, { recursive: true });
 
         yield* prepareAntigravityProfile({ profileDirectory, userHome });
         const configLink = path.join(profileDirectory, "config", "skills");
@@ -608,6 +611,81 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
         expect(yield* fs.exists(path.join(configLink, "own-skill"))).toBe(true);
         expect((yield* fs.stat(configLink)).type).toBe("Directory");
       }),
+  );
+
+  // Not gated on symlink support: the profile links with junctions on Windows, which need no privilege.
+  it.effect(
+    "does not link a missing global skills directory and removes a link left dangling",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+        const userHome = path.join(temporaryDirectory, "home");
+        const profileDirectory = path.join(temporaryDirectory, "profile");
+        const configLink = path.join(profileDirectory, "config", "skills");
+        const configSkills = path.join(userHome, ".gemini", "config", "skills");
+        const cliLink = path.join(profileDirectory, "antigravity-cli", "skills");
+        const cliSkills = path.join(userHome, ".gemini", "antigravity-cli", "skills");
+        const notLinked = (link: string) =>
+          fs.readLink(link).pipe(
+            Effect.result,
+            Effect.map((result) => Result.isFailure(result)),
+          );
+
+        // The agent cannot create its skills folder through a link to nothing.
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        for (const link of [configLink, cliLink]) {
+          expect(yield* notLinked(link)).toBe(true);
+          expect(yield* fs.exists(link)).toBe(false);
+        }
+
+        // With nothing to link, the agent creates a real directory. It stays while there is no target.
+        yield* fs.makeDirectory(configLink, { recursive: true });
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect((yield* fs.stat(configLink)).type).toBe("Directory");
+        expect(yield* notLinked(configLink)).toBe(true);
+
+        // The directories appear later: the next launch links them, replacing the empty real one.
+        yield* fs.makeDirectory(configSkills, { recursive: true });
+        yield* fs.makeDirectory(cliSkills, { recursive: true });
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect(yield* notLinked(configLink)).toBe(false);
+        expect(yield* notLinked(cliLink)).toBe(false);
+
+        // A directory goes away again: the next launch removes the now dangling link.
+        yield* fs.remove(cliSkills, { recursive: true });
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect(yield* notLinked(cliLink)).toBe(true);
+        expect(yield* fs.exists(cliLink)).toBe(false);
+        expect(yield* notLinked(configLink)).toBe(false);
+      }),
+  );
+
+  it.effect("treats a global skills directory that is itself a dangling link as missing", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+      const userHome = path.join(temporaryDirectory, "home");
+      const profileDirectory = path.join(temporaryDirectory, "profile");
+      const cliLink = path.join(profileDirectory, "antigravity-cli", "skills");
+      const cliSkills = path.join(userHome, ".gemini", "antigravity-cli", "skills");
+
+      yield* fs.makeDirectory(path.dirname(cliSkills), { recursive: true });
+      // A junction needs no privilege on Windows, unlike a directory symlink.
+      const linkType = (yield* HostProcess.Platform) === "win32" ? "junction" : "dir";
+      yield* Effect.tryPromise(() =>
+        NodeFSP.symlink(path.join(temporaryDirectory, "nowhere"), cliSkills, linkType),
+      );
+      yield* prepareAntigravityProfile({ profileDirectory, userHome });
+      expect(
+        yield* fs.readLink(cliLink).pipe(
+          Effect.result,
+          Effect.map((result) => Result.isFailure(result)),
+        ),
+      ).toBe(true);
+    }),
   );
 
   it.effect("rewrites the GCP block on every launch and never stores the API key", () =>
